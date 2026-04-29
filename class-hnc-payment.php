@@ -846,7 +846,9 @@ final class HNC_Payment {
 	 *   intent_token      (string, REQUIRED)
 	 *   amount            (int|string, REQUIRED) — paise per charge
 	 *   amount_unit       ('paise'|'rupees', default 'paise')
-	 *   frequency         (string, REQUIRED) — weekly|monthly|halfyearly|yearly
+	 *   frequency         (string, REQUIRED) — one of the periods returned by
+	 *                                          allowed_frequencies(). In this
+	 *                                          deployment that is monthly|yearly.
 	 *   donor_name        (string, optional)
 	 *   donor_email       (string, REQUIRED for subscriptions)
 	 *   donor_phone       (string, optional)
@@ -907,12 +909,31 @@ final class HNC_Payment {
 			);
 		}
 
-		// Frequency — must be a recurring frequency, not 'once'.
+		// Frequency — must be a recurring frequency, not 'once'. Error
+		// message is built from allowed_frequencies() so it always reflects
+		// what is actually accepted at runtime (admin filters can narrow
+		// the list, e.g. yearly-only campaign).
 		$frequency = self::sanitize_frequency( isset( $params['frequency'] ) ? $params['frequency'] : '' );
 		if ( '' === $frequency || self::FREQ_ONCE === $frequency ) {
+			$accepted = array_values( array_diff( self::allowed_frequencies(), array( self::FREQ_ONCE ) ) );
+			$count    = count( $accepted );
+			if ( 1 === $count ) {
+				$friendly = (string) $accepted[0];
+			} elseif ( 2 === $count ) {
+				$friendly = $accepted[0] . ' or ' . $accepted[1];
+			} elseif ( $count > 2 ) {
+				$last     = (string) array_pop( $accepted );
+				$friendly = implode( ', ', $accepted ) . ', or ' . $last;
+			} else {
+				$friendly = 'monthly';
+			}
 			return self::error_response(
 				'hnc_invalid_frequency',
-				__( 'Please choose a recurring plan: monthly or yearly.', 'helpnagaland-core' ),
+				sprintf(
+					/* translators: %s: comma-separated list of plan periods, e.g. "monthly or yearly" */
+					__( 'Please choose a valid plan: %s.', 'helpnagaland-core' ),
+					$friendly
+				),
 				400
 			);
 		}
@@ -938,7 +959,24 @@ final class HNC_Payment {
 		// (configured in wp-admin → Membership → Settings). Reject any amount
 		// that does not match. Stops API tampering and keeps the catalog as
 		// "fixed-price service" rather than "any amount = donation".
+		//
+		// expected_plan_price_paise returns:
+		//   > 0   strict equality required
+		//   == 0  no price configured yet — fall back to min/max only
+		//   <  0  frequency is not a fixed-price plan in this product —
+		//         reject the entire request (fail closed)
 		$expected_paise = self::expected_plan_price_paise( $frequency );
+		if ( $expected_paise < 0 ) {
+			return self::error_response(
+				'hnc_plan_not_available',
+				sprintf(
+					/* translators: %s: frequency name */
+					__( 'The %s plan is not available for purchase. Please choose a different plan.', 'helpnagaland-core' ),
+					$frequency
+				),
+				400
+			);
+		}
 		if ( $expected_paise > 0 && $amount_paise !== $expected_paise ) {
 			return self::error_response(
 				'hnc_amount_does_not_match_plan',
@@ -2021,22 +2059,45 @@ final class HNC_Payment {
 	}
 
 	/**
-	 * Configured plan price (paise) for a given frequency. Returns 0 if no
-	 * fixed price is configured for that frequency, in which case the strict
-	 * plan-match check is skipped and only the global min/max bounds apply.
+	 * Configured plan price (paise) for a given frequency.
 	 *
-	 * @param string $frequency 'monthly' | 'yearly'
-	 * @return int paise, or 0 if not configured
+	 * Return values:
+	 *   > 0   Configured paise. Caller MUST enforce strict equality against
+	 *         the submitted amount.
+	 *   == 0  Fixed-price plan exists for this frequency but the operator
+	 *         has not yet configured a price (price option missing or 0).
+	 *         Caller falls back to global min/max bounds only.
+	 *   < 0   Sentinel: this frequency is NOT a fixed-price plan in this
+	 *         deployment (e.g. weekly / halfyearly are valid Razorpay
+	 *         frequencies but we do not sell them). Caller MUST reject the
+	 *         entire request — fail closed instead of silently accepting
+	 *         arbitrary amounts for an un-priced plan.
+	 *
+	 * To add a new plan period: add a case below with its option_key, AND
+	 * add a matching admin price field in HNC_Admin_Payments, AND add the
+	 * plan tab in HNC_Public_Donate. Without all three, do NOT enable the
+	 * frequency via the hnc_payment_allowed_frequencies filter.
+	 *
+	 * @param string $frequency Any of the FREQ_* constants.
+	 * @return int paise (>0), 0 (unconfigured), or -1 (unsupported / sentinel).
 	 */
 	public static function expected_plan_price_paise( $frequency ) {
 		$option_key = '';
-		if ( self::FREQ_MONTHLY === $frequency ) {
-			$option_key = 'hnc_payment_monthly_amount_inr';
-		} elseif ( self::FREQ_YEARLY === $frequency ) {
-			$option_key = 'hnc_payment_yearly_amount_inr';
-		}
-		if ( '' === $option_key ) {
-			return 0;
+		switch ( $frequency ) {
+			case self::FREQ_MONTHLY:
+				$option_key = 'hnc_payment_monthly_amount_inr';
+				break;
+			case self::FREQ_YEARLY:
+				$option_key = 'hnc_payment_yearly_amount_inr';
+				break;
+			case self::FREQ_WEEKLY:
+			case self::FREQ_HALFYEARLY:
+				// Known recurring frequencies in the platform constants but
+				// NOT offered as fixed-price plans in this product. Sentinel.
+				return -1;
+			default:
+				// Unknown frequency. Sentinel — defensive.
+				return -1;
 		}
 		$inr = (int) get_option( $option_key, 0 );
 		return $inr > 0 ? $inr * 100 : 0;
