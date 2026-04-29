@@ -336,6 +336,20 @@ final class HNC_Payment {
 		// scheduled event fires, our methods run.
 		add_action( self::HOOK_PAYMENT_RECONCILE, array( __CLASS__, 'cron_reconcile' ) );
 		add_action( self::HOOK_PAYMENT_PURGE_PII, array( __CLASS__, 'cron_purge_pii' ) );
+
+		// Premium Membership: welcome email on first activation.
+		// We listen on three transition events because Razorpay can deliver
+		// any of them first depending on the payment flow. The handler is
+		// idempotent (transient-guarded), so receiving multiple events for
+		// the same row only sends one welcome email.
+		add_action( 'hnc_payment_subscription_authenticated', array( __CLASS__, 'on_member_activated' ), 10, 2 );
+		add_action( 'hnc_payment_subscription_activated',     array( __CLASS__, 'on_member_activated' ), 10, 2 );
+		add_action( 'hnc_payment_donation_captured',          array( __CLASS__, 'on_member_activated' ), 10, 2 );
+
+		// Member Code recovery shortcode. Place [hnc_membership_recover] on
+		// any WordPress page (e.g. /premium-membership/recover) to give
+		// members a self-service way to retrieve their code by email.
+		add_shortcode( 'hnc_membership_recover', array( __CLASS__, 'shortcode_membership_recover' ) );
 	}
 
 
@@ -832,7 +846,9 @@ final class HNC_Payment {
 	 *   intent_token      (string, REQUIRED)
 	 *   amount            (int|string, REQUIRED) — paise per charge
 	 *   amount_unit       ('paise'|'rupees', default 'paise')
-	 *   frequency         (string, REQUIRED) — weekly|monthly|halfyearly|yearly
+	 *   frequency         (string, REQUIRED) — one of the periods returned by
+	 *                                          allowed_frequencies(). In this
+	 *                                          deployment that is monthly|yearly.
 	 *   donor_name        (string, optional)
 	 *   donor_email       (string, REQUIRED for subscriptions)
 	 *   donor_phone       (string, optional)
@@ -893,12 +909,31 @@ final class HNC_Payment {
 			);
 		}
 
-		// Frequency — must be a recurring frequency, not 'once'.
+		// Frequency — must be a recurring frequency, not 'once'. Error
+		// message is built from allowed_frequencies() so it always reflects
+		// what is actually accepted at runtime (admin filters can narrow
+		// the list, e.g. yearly-only campaign).
 		$frequency = self::sanitize_frequency( isset( $params['frequency'] ) ? $params['frequency'] : '' );
 		if ( '' === $frequency || self::FREQ_ONCE === $frequency ) {
+			$accepted = array_values( array_diff( self::allowed_frequencies(), array( self::FREQ_ONCE ) ) );
+			$count    = count( $accepted );
+			if ( 1 === $count ) {
+				$friendly = (string) $accepted[0];
+			} elseif ( 2 === $count ) {
+				$friendly = $accepted[0] . ' or ' . $accepted[1];
+			} elseif ( $count > 2 ) {
+				$last     = (string) array_pop( $accepted );
+				$friendly = implode( ', ', $accepted ) . ', or ' . $last;
+			} else {
+				$friendly = 'monthly';
+			}
 			return self::error_response(
 				'hnc_invalid_frequency',
-				__( 'Please choose a recurring plan: monthly or yearly.', 'helpnagaland-core' ),
+				sprintf(
+					/* translators: %s: comma-separated list of plan periods, e.g. "monthly or yearly" */
+					__( 'Please choose a valid plan: %s.', 'helpnagaland-core' ),
+					$friendly
+				),
 				400
 			);
 		}
@@ -924,7 +959,24 @@ final class HNC_Payment {
 		// (configured in wp-admin → Membership → Settings). Reject any amount
 		// that does not match. Stops API tampering and keeps the catalog as
 		// "fixed-price service" rather than "any amount = donation".
+		//
+		// expected_plan_price_paise returns:
+		//   > 0   strict equality required
+		//   == 0  no price configured yet — fall back to min/max only
+		//   <  0  frequency is not a fixed-price plan in this product —
+		//         reject the entire request (fail closed)
 		$expected_paise = self::expected_plan_price_paise( $frequency );
+		if ( $expected_paise < 0 ) {
+			return self::error_response(
+				'hnc_plan_not_available',
+				sprintf(
+					/* translators: %s: frequency name */
+					__( 'The %s plan is not available for purchase. Please choose a different plan.', 'helpnagaland-core' ),
+					$frequency
+				),
+				400
+			);
+		}
 		if ( $expected_paise > 0 && $amount_paise !== $expected_paise ) {
 			return self::error_response(
 				'hnc_amount_does_not_match_plan',
@@ -2007,22 +2059,45 @@ final class HNC_Payment {
 	}
 
 	/**
-	 * Configured plan price (paise) for a given frequency. Returns 0 if no
-	 * fixed price is configured for that frequency, in which case the strict
-	 * plan-match check is skipped and only the global min/max bounds apply.
+	 * Configured plan price (paise) for a given frequency.
 	 *
-	 * @param string $frequency 'monthly' | 'yearly'
-	 * @return int paise, or 0 if not configured
+	 * Return values:
+	 *   > 0   Configured paise. Caller MUST enforce strict equality against
+	 *         the submitted amount.
+	 *   == 0  Fixed-price plan exists for this frequency but the operator
+	 *         has not yet configured a price (price option missing or 0).
+	 *         Caller falls back to global min/max bounds only.
+	 *   < 0   Sentinel: this frequency is NOT a fixed-price plan in this
+	 *         deployment (e.g. weekly / halfyearly are valid Razorpay
+	 *         frequencies but we do not sell them). Caller MUST reject the
+	 *         entire request — fail closed instead of silently accepting
+	 *         arbitrary amounts for an un-priced plan.
+	 *
+	 * To add a new plan period: add a case below with its option_key, AND
+	 * add a matching admin price field in HNC_Admin_Payments, AND add the
+	 * plan tab in HNC_Public_Donate. Without all three, do NOT enable the
+	 * frequency via the hnc_payment_allowed_frequencies filter.
+	 *
+	 * @param string $frequency Any of the FREQ_* constants.
+	 * @return int paise (>0), 0 (unconfigured), or -1 (unsupported / sentinel).
 	 */
 	public static function expected_plan_price_paise( $frequency ) {
 		$option_key = '';
-		if ( self::FREQ_MONTHLY === $frequency ) {
-			$option_key = 'hnc_payment_monthly_amount_inr';
-		} elseif ( self::FREQ_YEARLY === $frequency ) {
-			$option_key = 'hnc_payment_yearly_amount_inr';
-		}
-		if ( '' === $option_key ) {
-			return 0;
+		switch ( $frequency ) {
+			case self::FREQ_MONTHLY:
+				$option_key = 'hnc_payment_monthly_amount_inr';
+				break;
+			case self::FREQ_YEARLY:
+				$option_key = 'hnc_payment_yearly_amount_inr';
+				break;
+			case self::FREQ_WEEKLY:
+			case self::FREQ_HALFYEARLY:
+				// Known recurring frequencies in the platform constants but
+				// NOT offered as fixed-price plans in this product. Sentinel.
+				return -1;
+			default:
+				// Unknown frequency. Sentinel — defensive.
+				return -1;
 		}
 		$inr = (int) get_option( $option_key, 0 );
 		return $inr > 0 ? $inr * 100 : 0;
@@ -5374,6 +5449,327 @@ final class HNC_Payment {
 			'captured_count_fytd'       => $captured_count,
 			'captured_total_paise_fytd' => $captured_total,
 		);
+	}
+
+
+	/* ==================================================================
+	 * PREMIUM MEMBERSHIP: WELCOME EMAIL + CODE RECOVERY
+	 * ==================================================================
+	 *
+	 * The donation row's public_code IS the Member Code that members type
+	 * into the drug/alcohol report forms. We need to (a) deliver it to the
+	 * member at activation time, and (b) let them recover it if they lose
+	 * it. Razorpay's own confirmation email contains its payment_id, not
+	 * our public_code, so we send our own.
+	 */
+
+	/**
+	 * Hook callback for hnc_payment_subscription_authenticated /
+	 * hnc_payment_subscription_activated / hnc_payment_donation_captured.
+	 *
+	 * Sends the welcome email exactly once per donation row, guarded by a
+	 * 30-day transient. Multiple webhook events for the same row (auth +
+	 * active + first-charge) all fire this handler but only the first one
+	 * sends an email.
+	 *
+	 * @param int   $donation_id Donation row id.
+	 * @param array $row         Snapshot of the row (associative array).
+	 * @return void
+	 */
+	public static function on_member_activated( $donation_id, $row ) {
+		$donation_id = (int) $donation_id;
+		if ( $donation_id <= 0 ) {
+			return;
+		}
+
+		// Idempotency guard. Even if Razorpay redelivers webhooks, we only
+		// send one welcome email per row.
+		$guard_key = 'hnc_welcome_sent_' . $donation_id;
+		if ( get_transient( $guard_key ) ) {
+			return;
+		}
+
+		// Load the row fresh in case the snapshot is stale.
+		$row = self::get_donation( $donation_id );
+		if ( ! is_array( $row ) ) {
+			return;
+		}
+
+		$email = isset( $row['donor_email'] ) ? (string) $row['donor_email'] : '';
+		$email = is_email( $email ) ? $email : '';
+		if ( '' === $email ) {
+			// One-time orders may not have an email on file. Nothing we can do.
+			return;
+		}
+
+		$public_code = isset( $row['public_code'] ) ? (string) $row['public_code'] : '';
+		if ( '' === $public_code ) {
+			return;
+		}
+
+		$donor_name = isset( $row['donor_name'] ) && ! empty( $row['donor_anonymous'] ) === false
+			? (string) $row['donor_name']
+			: '';
+
+		$ok = self::send_welcome_email( $email, $public_code, $donor_name );
+		if ( $ok ) {
+			// 30 days is comfortably longer than any plausible webhook retry window.
+			set_transient( $guard_key, 1, 30 * DAY_IN_SECONDS );
+			if ( class_exists( 'HNC_Logger' ) ) {
+				HNC_Logger::log_system(
+					'payment_welcome_email_sent',
+					array(
+						'donation_id' => $donation_id,
+						'public_code' => $public_code,
+					)
+				);
+			}
+		}
+	}
+
+	/**
+	 * Send the Premium Member welcome email containing the Member Code.
+	 *
+	 * @param string $email       Recipient email (already validated).
+	 * @param string $public_code Member Code (donation row public_code).
+	 * @param string $donor_name  Donor name, or empty for anonymous greeting.
+	 * @return bool True if wp_mail accepted the message.
+	 */
+	public static function send_welcome_email( $email, $public_code, $donor_name = '' ) {
+		$site_name = (string) get_bloginfo( 'name' );
+		if ( '' === $site_name ) {
+			$site_name = 'Help Nagaland';
+		}
+		$home_url  = (string) home_url( '/' );
+		$greeting  = '' !== trim( $donor_name ) ? sprintf( 'Hi %s,', $donor_name ) : 'Hi,';
+
+		$subject = sprintf( 'Welcome to %s Premium Membership', $site_name );
+
+		$body  = $greeting . "\n\n";
+		$body .= 'Your ' . $site_name . ' Premium Membership is now active.' . "\n\n";
+		$body .= 'Your Member Code is:' . "\n\n";
+		$body .= '    ' . $public_code . "\n\n";
+		$body .= 'Use this code on the report forms at ' . $home_url . ' to:' . "\n\n";
+		$body .= '  - Attach a contact number on drug tips for police-reward eligibility' . "\n";
+		$body .= '  - Get your alcohol-report pin highlighted on the public map' . "\n";
+		$body .= '  - Receive priority moderator review' . "\n\n";
+		$body .= 'Save this email — you will need this code each time you submit a report.' . "\n\n";
+		$body .= 'Razorpay will send you a separate email with your payment receipt and a link to manage or cancel your subscription.' . "\n\n";
+		$body .= 'Thank you for supporting civic reporting.' . "\n\n";
+		$body .= '— ' . $site_name . "\n";
+		$body .= $home_url . "\n";
+
+		// Allow operator to override headers (From, Reply-To) via a filter.
+		$headers = apply_filters( 'hnc_membership_email_headers', array() );
+
+		return (bool) wp_mail( $email, $subject, $body, $headers );
+	}
+
+	/**
+	 * Render the [hnc_membership_recover] shortcode and process its form
+	 * submission. Pure server-side: no JS required, works without external
+	 * assets. Form posts to the same URL.
+	 *
+	 * @param array $atts Unused.
+	 * @return string Rendered HTML.
+	 */
+	public static function shortcode_membership_recover( $atts = array() ) {
+		$message      = '';
+		$message_type = '';
+
+		// Process POST, if any. Intentionally always returns the same success
+		// message whether or not the email was found — prevents enumeration.
+		if (
+			isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD']
+			&& isset( $_POST['hnc_recover_email'], $_POST['hnc_recover_nonce'] )
+		) {
+			$nonce = isset( $_POST['hnc_recover_nonce'] ) ? sanitize_text_field( wp_unslash( $_POST['hnc_recover_nonce'] ) ) : '';
+			if ( ! wp_verify_nonce( $nonce, 'hnc_membership_recover' ) ) {
+				$message      = __( 'Your session has expired. Please reload the page and try again.', 'helpnagaland-core' );
+				$message_type = 'error';
+			} else {
+				// Light rate-limit: 5 submissions per IP per 10 minutes.
+				$throttle_ok = self::recover_rate_check();
+				if ( ! $throttle_ok ) {
+					$message      = __( 'Too many attempts. Please wait a few minutes before trying again.', 'helpnagaland-core' );
+					$message_type = 'error';
+				} else {
+					$raw_email = isset( $_POST['hnc_recover_email'] ) ? wp_unslash( $_POST['hnc_recover_email'] ) : '';
+					$email     = sanitize_email( (string) $raw_email );
+					if ( '' === $email || ! is_email( $email ) ) {
+						$message      = __( 'Please enter a valid email address.', 'helpnagaland-core' );
+						$message_type = 'error';
+					} else {
+						self::do_recovery( $email );
+						$message      = __( 'If we have an active Premium Membership for that email, we have just sent the Member Code to it. Please check your inbox in a moment (and your spam folder, just in case).', 'helpnagaland-core' );
+						$message_type = 'success';
+					}
+				}
+			}
+		}
+
+		ob_start();
+		?>
+		<div class="hnc-recover" style="max-width:520px;margin:0 auto;padding:24px;">
+			<h2 style="margin-top:0;"><?php esc_html_e( 'Recover your Member Code', 'helpnagaland-core' ); ?></h2>
+			<p><?php esc_html_e( 'Enter the email you used when you became a Premium Member. We will email your active Member Code to that address.', 'helpnagaland-core' ); ?></p>
+
+			<?php if ( '' !== $message ) : ?>
+				<p style="padding:12px 14px;border-radius:6px;<?php echo 'success' === $message_type ? 'background:#e6f4ee;border:1px solid #0A7558;color:#0F2419;' : 'background:#fde8e8;border:1px solid #b32d2e;color:#7a1d1d;'; ?>">
+					<?php echo esc_html( $message ); ?>
+				</p>
+			<?php endif; ?>
+
+			<form method="post" style="display:flex;flex-direction:column;gap:12px;">
+				<?php wp_nonce_field( 'hnc_membership_recover', 'hnc_recover_nonce' ); ?>
+				<label style="font-size:14px;color:#374151;">
+					<?php esc_html_e( 'Email address', 'helpnagaland-core' ); ?>
+					<input
+						type="email"
+						name="hnc_recover_email"
+						required
+						autocomplete="email"
+						placeholder="you@example.com"
+						style="display:block;width:100%;margin-top:6px;padding:12px 14px;font-size:16px;border:1.5px solid #d1d5db;border-radius:8px;background:#fff;color:#1A1A1A;"
+					>
+				</label>
+				<button type="submit" style="padding:14px 20px;font-size:16px;font-weight:600;color:#fff;background:#0A7558;border:1.5px solid #0A7558;border-radius:8px;cursor:pointer;">
+					<?php esc_html_e( 'Send my Member Code', 'helpnagaland-core' ); ?>
+				</button>
+			</form>
+		</div>
+		<?php
+		return (string) ob_get_clean();
+	}
+
+	/**
+	 * Look up active member rows by email and send the codes via email.
+	 * Always returns silently — caller renders a generic "if we have it"
+	 * success message regardless, to prevent email enumeration.
+	 *
+	 * @param string $email Validated email.
+	 * @return void
+	 */
+	public static function do_recovery( $email ) {
+		$email = is_email( $email ) ? $email : '';
+		if ( '' === $email ) {
+			return;
+		}
+
+		$email_hash = self::hash_email( $email );
+		if ( '' === $email_hash ) {
+			return;
+		}
+
+		global $wpdb;
+		$table = self::table_donations();
+
+		$active_statuses = array(
+			self::STATUS_CAPTURED,
+			self::STATUS_AUTHORIZED,
+			self::STATUS_ACTIVE,
+			self::STATUS_AUTHENTICATED,
+			self::STATUS_RESUMED,
+			self::STATUS_PAUSED,
+		);
+		$placeholders = implode( ', ', array_fill( 0, count( $active_statuses ), '%s' ) );
+
+		// Build prepare args: email_hash + each status.
+		$args = array_merge( array( $email_hash ), $active_statuses );
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+		$sql = $wpdb->prepare(
+			"SELECT public_code, type, frequency, status FROM {$table}
+			 WHERE donor_email_hash = %s AND status IN ( {$placeholders} )
+			 ORDER BY id DESC LIMIT 10",
+			$args
+		);
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared
+		$rows = $wpdb->get_results( $sql, ARRAY_A );
+		if ( ! is_array( $rows ) || empty( $rows ) ) {
+			return;
+		}
+
+		$codes = array();
+		foreach ( $rows as $r ) {
+			$pc = isset( $r['public_code'] ) ? (string) $r['public_code'] : '';
+			if ( '' !== $pc ) {
+				$codes[] = $pc;
+			}
+		}
+		$codes = array_values( array_unique( $codes ) );
+		if ( empty( $codes ) ) {
+			return;
+		}
+
+		self::send_recovery_email( $email, $codes );
+
+		if ( class_exists( 'HNC_Logger' ) ) {
+			HNC_Logger::log_system(
+				'payment_recovery_email_sent',
+				array(
+					'codes_count' => count( $codes ),
+				)
+			);
+		}
+	}
+
+	/**
+	 * Send the Member Code recovery email.
+	 *
+	 * @param string   $email Recipient email.
+	 * @param string[] $codes One or more active public_codes.
+	 * @return bool True if wp_mail accepted the message.
+	 */
+	public static function send_recovery_email( $email, $codes ) {
+		$site_name = (string) get_bloginfo( 'name' );
+		if ( '' === $site_name ) {
+			$site_name = 'Help Nagaland';
+		}
+		$home_url = (string) home_url( '/' );
+
+		$subject = sprintf( 'Your %s Member Code', $site_name );
+
+		$body  = 'Hi,' . "\n\n";
+		$body .= 'Someone (hopefully you) requested your ' . $site_name . ' Member Code.' . "\n\n";
+		if ( count( $codes ) > 1 ) {
+			$body .= 'Your active Premium Member Codes:' . "\n\n";
+		} else {
+			$body .= 'Your active Premium Member Code:' . "\n\n";
+		}
+		foreach ( $codes as $c ) {
+			$body .= '    ' . $c . "\n";
+		}
+		$body .= "\n";
+		$body .= 'Use this on the report forms at ' . $home_url . ' to unlock priority review and reward-eligible contact on drug tips.' . "\n\n";
+		$body .= 'If you did not request this, you can safely ignore this email.' . "\n\n";
+		$body .= '— ' . $site_name . "\n";
+		$body .= $home_url . "\n";
+
+		$headers = apply_filters( 'hnc_membership_email_headers', array() );
+
+		return (bool) wp_mail( $email, $subject, $body, $headers );
+	}
+
+	/**
+	 * Light rate-limit guard for the recovery form. Uses a per-IP transient.
+	 * 5 attempts per 10 minutes; resets cleanly on expiry.
+	 *
+	 * @return bool True if the request is allowed.
+	 */
+	private static function recover_rate_check() {
+		$ip = self::client_ip();
+		if ( '' === $ip ) {
+			return true;
+		}
+		$key   = 'hnc_recover_rl_' . md5( $ip );
+		$count = (int) get_transient( $key );
+		if ( $count >= 5 ) {
+			return false;
+		}
+		set_transient( $key, $count + 1, 10 * MINUTE_IN_SECONDS );
+		return true;
 	}
 }
 
